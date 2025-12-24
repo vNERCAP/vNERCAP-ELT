@@ -4,13 +4,12 @@
 
   let frequency = 121.5;
   let modulation = 'AM';
-  let pattern = 'Expanding square';
   let power = 5;
   let altitude = 4500;
   let updateRate = 2;
   let view = 'admin';
-  let callsign = 'CAP606';
-  let aircraft = null;
+  let callsigns = ['CAP606', '', '', '', '', ''];
+  let aircraftList = [];
   let lastVatsimUpdate = '';
   let vatsimError = '';
   let eltLat = 39.5;
@@ -23,7 +22,6 @@
   let vatsimTimer = null;
   let logs = [];
 
-  const patterns = ['Expanding square', 'Creeping line', 'Parallel track', 'Sector search'];
   const modulationModes = ['AM', 'FM'];
   const views = [
     { id: 'admin', label: 'Admin console' },
@@ -47,29 +45,45 @@
   };
 
   const pollVatsim = async () => {
-    if (!callsign) return;
-    try {
-      const data = await fetchVatsimFlight(callsign);
-      aircraft = data;
-      lastVatsimUpdate = new Date().toLocaleTimeString();
-      vatsimError = '';
-    } catch (err) {
-      vatsimError = err.message;
+    const active = callsigns.map((c) => c.trim()).filter(Boolean);
+    if (!active.length) {
+      aircraftList = [];
+      return;
     }
+    const results = await Promise.allSettled(active.map((cs) => fetchVatsimFlight(cs)));
+    const successes = [];
+    let errors = [];
+    results.forEach((res, idx) => {
+      const cs = active[idx];
+      if (res.status === 'fulfilled') {
+        successes.push(res.value);
+      } else {
+        errors.push(`${cs}: ${res.reason?.message || 'error'}`);
+      }
+    });
+    aircraftList = successes;
+    vatsimError = errors.join(' | ');
+    lastVatsimUpdate = new Date().toLocaleTimeString();
   };
 
   const computeSignal = () => {
-    if (aircraft && Number.isFinite(eltLat) && Number.isFinite(eltLon)) {
-      const relBearing = Math.round(bearingBetween(aircraft.lat, aircraft.lon, eltLat, eltLon));
-      const distNm = haversineDistanceNm(aircraft.lat, aircraft.lon, eltLat, eltLon);
+    const beaconValid = Number.isFinite(eltLat) && Number.isFinite(eltLon);
+    if (aircraftList.length && beaconValid) {
+      const byDistance = aircraftList
+        .map((ac) => ({
+          ...ac,
+          dist: haversineDistanceNm(ac.lat, ac.lon, eltLat, eltLon)
+        }))
+        .sort((a, b) => a.dist - b.dist);
+      const target = byDistance[0];
+      const relBearing = Math.round(bearingBetween(target.lat, target.lon, eltLat, eltLon));
+      const distNm = target.dist;
       bearing = (relBearing + 360) % 360;
-      // Simple falloff: stronger when close, capped between 5-99
       const rawStrength = clamp(100 - distNm * 2 - Math.max(0, (altitude - 3000) / 2000), 5, 99);
       strength = Math.round(rawStrength);
       sweep = (sweep + 15) % 360;
-      logEvent(`Ping ${bearing}° | strength ${strength}% | dist ~${distNm.toFixed(1)}nm`);
+      logEvent(`Ping ${bearing}° | ${target.callsign} | strength ${strength}% | dist ~${distNm.toFixed(1)}nm`);
     } else {
-      // Fallback noisy simulation if no aircraft data
       sweep = (sweep + 15) % 360;
       bearing = Math.floor(Math.random() * 360);
       strength = clamp(Math.round(40 + power * 6 + Math.random() * 10 - 5), 5, 99);
@@ -121,7 +135,7 @@
       </div>
       <h1 class="text-3xl md:text-4xl font-semibold tracking-tight text-white">vNERCAP ELT Simulator</h1>
       <p class="text-slate-300 max-w-3xl">
-        Configure a virtual ELT beacon, watch relative bearings and signal strength, and practice CAP-style search patterns.
+        Configure a virtual ELT beacon, watch relative bearings and signal strength, and practice CAP-style search.
       </p>
 
       <div class="inline-flex rounded-full bg-slate-900 border border-slate-800 p-1 w-fit">
@@ -143,33 +157,46 @@
             <div class="flex items-center justify-between gap-3 pb-3 border-b border-slate-800">
               <div>
                 <h2 class="text-xl font-semibold text-white">Network + ELT position</h2>
-                <p class="text-slate-400 text-sm">Pull CAP aircraft from VATSIM every 15s and set beacon coordinates.</p>
+                <p class="text-slate-400 text-sm">Pull up to 6 CAP aircraft from VATSIM every 15s; set beacon coordinates.</p>
               </div>
               <button class="btn-ghost" on:click={pollVatsim}>Refresh now</button>
             </div>
 
-            <div class="grid gap-4 md:grid-cols-2">
-              <label class="space-y-2">
-                <div class="flex items-center gap-2 text-sm text-slate-200">VATSIM callsign</div>
-                <input class="input" bind:value={callsign} placeholder="CAP606" />
-              </label>
-              <div class="rounded-xl border border-slate-800 bg-slate-950 p-4 space-y-2 text-sm text-slate-200">
-                <div class="flex items-center justify-between">
-                  <span class="text-slate-400">Last update</span>
-                  <span class="font-semibold text-white">{lastVatsimUpdate || '—'}</span>
-                </div>
-                <div class="flex items-center justify-between">
-                  <span class="text-slate-400">Status</span>
-                  <span class={`text-xs px-2 py-1 rounded-full ${vatsimError ? 'bg-amber-500/20 text-amber-200' : 'bg-emerald-500/20 text-emerald-200'}`}>
-                    {vatsimError ? 'Error' : 'OK'}
-                  </span>
-                </div>
-                {#if vatsimError}
-                  <p class="text-xs text-amber-200">{vatsimError}</p>
-                {:else if aircraft}
-                  <p class="text-xs text-slate-400">Alt {aircraft.alt?.toFixed(0) ?? '—'} | GS {aircraft.groundspeed ?? '—'} | Pos {aircraft.lat?.toFixed(3)}, {aircraft.lon?.toFixed(3)}</p>
-                {/if}
+            <div class="grid gap-3 md:grid-cols-3">
+              {#each callsigns as cs, idx}
+                <label class="space-y-1">
+                  <div class="flex items-center justify-between text-xs text-slate-400">
+                    <span>Callsign #{idx + 1}</span>
+                  </div>
+                  <input class="input" bind:value={callsigns[idx]} placeholder="CAP606" />
+                </label>
+              {/each}
+            </div>
+
+            <div class="rounded-xl border border-slate-800 bg-slate-950 p-4 space-y-2 text-sm text-slate-200">
+              <div class="flex items-center justify-between">
+                <span class="text-slate-400">Last update</span>
+                <span class="font-semibold text-white">{lastVatsimUpdate || '—'}</span>
               </div>
+              <div class="flex items-center justify-between">
+                <span class="text-slate-400">Status</span>
+                <span class={`text-xs px-2 py-1 rounded-full ${vatsimError ? 'bg-amber-500/20 text-amber-200' : 'bg-emerald-500/20 text-emerald-200'}`}>
+                  {vatsimError ? 'With errors' : 'OK'}
+                </span>
+              </div>
+              {#if vatsimError}
+                <p class="text-xs text-amber-200">{vatsimError}</p>
+              {/if}
+              {#if aircraftList.length}
+                <div class="grid gap-1 text-xs text-slate-300">
+                  {#each aircraftList as ac}
+                    <div class="flex items-center justify-between">
+                      <span class="font-semibold text-slate-100">{ac.callsign}</span>
+                      <span class="text-slate-400">{ac.lat?.toFixed(3)}, {ac.lon?.toFixed(3)} | Alt {ac.alt?.toFixed(0) ?? '—'}</span>
+                    </div>
+                  {/each}
+                </div>
+              {/if}
             </div>
 
             <div class="grid gap-4 md:grid-cols-2">
@@ -188,7 +215,7 @@
             <div class="flex items-center justify-between gap-3 pb-4 border-b border-slate-800">
               <div>
                 <h2 class="text-xl font-semibold text-white">Beacon configuration</h2>
-                <p class="text-slate-400 text-sm">Set ELT transmit parameters and pattern assumptions.</p>
+                <p class="text-slate-400 text-sm">Set ELT transmit parameters and beacon power.</p>
               </div>
               <span class="rounded-full bg-slate-800 px-3 py-1 text-xs font-semibold text-slate-300 uppercase tracking-wide">
                 Training use only
@@ -205,14 +232,6 @@
                 <select class="input" bind:value={modulation}>
                   {#each modulationModes as mode}
                     <option value={mode}>{mode}</option>
-                  {/each}
-                </select>
-              </label>
-              <label class="space-y-2">
-                <div class="flex items-center gap-2 text-sm text-slate-200">Search pattern</div>
-                <select class="input" bind:value={pattern}>
-                  {#each patterns as name}
-                    <option value={name}>{name}</option>
                   {/each}
                 </select>
               </label>
@@ -303,8 +322,8 @@
             <li class="flex items-start gap-3">
               <span class="badge">3</span>
               <div>
-                <p class="font-semibold text-white">Start search pattern</p>
-                <p class="text-slate-400">Fly expanding square, creeping line, or sector search.</p>
+                <p class="font-semibold text-white">Start search leg</p>
+                <p class="text-slate-400">Fly your planned pattern (expanding square, creeping line, sector, etc.).</p>
               </div>
             </li>
             <li class="flex items-start gap-3">
@@ -378,10 +397,6 @@
                 <div class="flex items-center justify-between">
                   <span class="text-slate-400">Frequency</span>
                   <span class="font-semibold text-white">{frequency} MHz {modulation}</span>
-                </div>
-                <div class="flex items-center justify-between">
-                  <span class="text-slate-400">Search pattern</span>
-                  <span class="font-semibold text-white">{pattern}</span>
                 </div>
                 <div class="flex items-center justify-between">
                   <span class="text-slate-400">Update cadence</span>
